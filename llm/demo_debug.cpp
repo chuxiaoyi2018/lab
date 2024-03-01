@@ -109,7 +109,7 @@ static inline uint32_t fp16_ieee_to_fp32_bits(uint16_t h) {
 }
 
 
-void dump_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
+void dump_fp16_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
   auto shape = tensor.shape;
   int size = 1;
   for (int i = 0; i < shape.num_dims; ++i){
@@ -129,6 +129,24 @@ void dump_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
   std::cout<<"-------------------------------------"<<std::endl;
   // uint32_t t = fp16_ieee_to_fp32_bits(data[0]);
   // std::cout << (float)t << std::endl;
+  auto ptr = data.data();
+  ptr[0] = ptr[0];
+}
+
+void dump_fp32_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
+  auto shape = tensor.shape;
+  int size = 1;
+  for (int i = 0; i < shape.num_dims; ++i){
+    size *= shape.dims[i];
+  }
+  std::vector<uint16_t> data(size);
+  bm_memcpy_d2s(bm_handle, data.data(), tensor.device_mem);
+  std::cout<<"-------------------------------------"<<std::endl;
+  std::cout<< data[data.size()-1] << std::endl;
+  for(int i=0;i<10;i++){
+    std::cout<< data[i] << std::endl;
+  }
+  std::cout<<"-------------------------------------"<<std::endl;
   auto ptr = data.data();
   ptr[0] = ptr[0];
 }
