@@ -22,7 +22,6 @@
 
 static const uint16_t ATTENTION_MASK = 0xF0E2;
 
-
 typedef union {
   float    fval;
   uint32_t bits;
@@ -133,14 +132,47 @@ void dump_fp16_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
   ptr[0] = ptr[0];
 }
 
-void dump_fp32_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
+static inline uint32_t bf16_to_fp32_bits(uint16_t h) {
+  // BF16 的位模式是：1 位符号，8 位指数，7 位尾数
+  // 我们需要将其转换为 float 的位模式：1 位符号，8 位指数，23 位尾数
+  // 扩展 BF16 到 32 位，尾数部分需要填充 16 位的 0
+  uint32_t sign = (uint32_t)(h & 0x8000) << 16; // 符号位
+  uint32_t exp  = (uint32_t)(h & 0x7F80) << 16; // 指数位
+  uint32_t frac = (uint32_t)(h & 0x007F) << 16; // 尾数位
+
+  // 将尾数的 7 位左移，以对齐到 23 位尾数的位置
+  frac <<= (23 - 7);
+  
+  // 组合成 float 的位模式
+  return sign | exp | frac;
+}
+
+void dump_bf16_tensor(bm_handle_t bm_handle, bm_device_mem_t mem, int offset) {
+  int size = 10;
+  std::vector<uint16_t> data(size);
+  bm_memcpy_d2s(bm_handle, data.data(), mem);
+  std::cout << "-------------------------------------" << std::endl;
+  fp32 t;
+  // 使用最后一个数据作为示例
+  t.bits = bf16_to_fp32_bits(data[0]);
+  std::cout << t.fval << std::endl;
+  // 打印前 10 个数据
+  for(int i = 0; i < 10; i++){
+    t.bits = bf16_to_fp32_bits(data[i]);
+    std::cout << t.fval << std::endl;
+  }
+  std::cout << "-------------------------------------" << std::endl;
+}
+
+
+void dump_fp32_tensor(bm_handle_t bm_handle, bm_device_mem_t &mem, int offset) {
   auto shape = tensor.shape;
   int size = 1;
   for (int i = 0; i < shape.num_dims; ++i){
     size *= shape.dims[i];
   }
   std::vector<uint16_t> data(size);
-  bm_memcpy_d2s(bm_handle, data.data(), tensor.device_mem);
+  bm_memcpy_d2s(bm_handle, data.data(), mem);
   std::cout<<"-------------------------------------"<<std::endl;
   std::cout<< data[data.size()-1] << std::endl;
   for(int i=0;i<10;i++){

@@ -18,128 +18,142 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <random>
+#include <numeric>
 
 static const uint16_t ATTENTION_MASK = 0xF0E2; // -9984 by bfloat16
 
 typedef union {
-  float    fval;
+  float fval;
   uint32_t bits;
   struct {
     uint32_t frac : 23; // mantissa
-    uint32_t exp  : 8;  // exponent
+    uint32_t exp : 8;   // exponent
     uint32_t sign : 1;  // sign
   } format;
 } fp32;
 
 static inline uint32_t fp16_ieee_to_fp32_bits(uint16_t h) {
-	/*
-	 * Extend the half-precision floating-point number to 32 bits and shift to the upper part of the 32-bit word:
-	 *      +---+-----+------------+-------------------+
-	 *      | S |EEEEE|MM MMMM MMMM|0000 0000 0000 0000|
-	 *      +---+-----+------------+-------------------+
-	 * Bits  31  26-30    16-25            0-15
-	 *
-	 * S - sign bit, E - bits of the biased exponent, M - bits of the mantissa, 0 - zero bits.
-	 */
-	const uint32_t w = (uint32_t) h << 16;
-	/*
-	 * Extract the sign of the input number into the high bit of the 32-bit word:
-	 *
-	 *      +---+----------------------------------+
-	 *      | S |0000000 00000000 00000000 00000000|
-	 *      +---+----------------------------------+
-	 * Bits  31                 0-31
-	 */
-	const uint32_t sign = w & UINT32_C(0x80000000);
-	/*
-	 * Extract mantissa and biased exponent of the input number into the bits 0-30 of the 32-bit word:
-	 *
-	 *      +---+-----+------------+-------------------+
-	 *      | 0 |EEEEE|MM MMMM MMMM|0000 0000 0000 0000|
-	 *      +---+-----+------------+-------------------+
-	 * Bits  30  27-31     17-26            0-16
-	 */
-	const uint32_t nonsign = w & UINT32_C(0x7FFFFFFF);
-	/*
-	 * Renorm shift is the number of bits to shift mantissa left to make the half-precision number normalized.
-	 * If the initial number is normalized, some of its high 6 bits (sign == 0 and 5-bit exponent) equals one.
-	 * In this case renorm_shift == 0. If the number is denormalize, renorm_shift > 0. Note that if we shift
-	 * denormalized nonsign by renorm_shift, the unit bit of mantissa will shift into exponent, turning the
-	 * biased exponent into 1, and making mantissa normalized (i.e. without leading 1).
-	 */
+  /*
+   * Extend the half-precision floating-point number to 32 bits and shift to the
+   * upper part of the 32-bit word:
+   *      +---+-----+------------+-------------------+
+   *      | S |EEEEE|MM MMMM MMMM|0000 0000 0000 0000|
+   *      +---+-----+------------+-------------------+
+   * Bits  31  26-30    16-25            0-15
+   *
+   * S - sign bit, E - bits of the biased exponent, M - bits of the mantissa, 0
+   * - zero bits.
+   */
+  const uint32_t w = (uint32_t)h << 16;
+  /*
+   * Extract the sign of the input number into the high bit of the 32-bit word:
+   *
+   *      +---+----------------------------------+
+   *      | S |0000000 00000000 00000000 00000000|
+   *      +---+----------------------------------+
+   * Bits  31                 0-31
+   */
+  const uint32_t sign = w & UINT32_C(0x80000000);
+  /*
+   * Extract mantissa and biased exponent of the input number into the bits 0-30
+   * of the 32-bit word:
+   *
+   *      +---+-----+------------+-------------------+
+   *      | 0 |EEEEE|MM MMMM MMMM|0000 0000 0000 0000|
+   *      +---+-----+------------+-------------------+
+   * Bits  30  27-31     17-26            0-16
+   */
+  const uint32_t nonsign = w & UINT32_C(0x7FFFFFFF);
+  /*
+   * Renorm shift is the number of bits to shift mantissa left to make the
+   * half-precision number normalized. If the initial number is normalized, some
+   * of its high 6 bits (sign == 0 and 5-bit exponent) equals one. In this case
+   * renorm_shift == 0. If the number is denormalize, renorm_shift > 0. Note
+   * that if we shift denormalized nonsign by renorm_shift, the unit bit of
+   * mantissa will shift into exponent, turning the biased exponent into 1, and
+   * making mantissa normalized (i.e. without leading 1).
+   */
 #ifdef _MSC_VER
-	unsigned long nonsign_bsr;
-	_BitScanReverse(&nonsign_bsr, (unsigned long) nonsign);
-	uint32_t renorm_shift = (uint32_t) nonsign_bsr ^ 31;
+  unsigned long nonsign_bsr;
+  _BitScanReverse(&nonsign_bsr, (unsigned long)nonsign);
+  uint32_t renorm_shift = (uint32_t)nonsign_bsr ^ 31;
 #else
-	uint32_t renorm_shift = __builtin_clz(nonsign);
+  uint32_t renorm_shift = __builtin_clz(nonsign);
 #endif
-	renorm_shift = renorm_shift > 5 ? renorm_shift - 5 : 0;
-	/*
-	 * Iff half-precision number has exponent of 15, the addition overflows it into bit 31,
-	 * and the subsequent shift turns the high 9 bits into 1. Thus
-	 *   inf_nan_mask ==
-	 *                   0x7F800000 if the half-precision number had exponent of 15 (i.e. was NaN or infinity)
-	 *                   0x00000000 otherwise
-	 */
-	const int32_t inf_nan_mask = ((int32_t) (nonsign + 0x04000000) >> 8) & INT32_C(0x7F800000);
-	/*
-	 * Iff nonsign is 0, it overflows into 0xFFFFFFFF, turning bit 31 into 1. Otherwise, bit 31 remains 0.
-	 * The signed shift right by 31 broadcasts bit 31 into all bits of the zero_mask. Thus
-	 *   zero_mask ==
-	 *                0xFFFFFFFF if the half-precision number was zero (+0.0h or -0.0h)
-	 *                0x00000000 otherwise
-	 */
-	const int32_t zero_mask = (int32_t) (nonsign - 1) >> 31;
-	/*
-	 * 1. Shift nonsign left by renorm_shift to normalize it (if the input was denormal)
-	 * 2. Shift nonsign right by 3 so the exponent (5 bits originally) becomes an 8-bit field and 10-bit mantissa
-	 *    shifts into the 10 high bits of the 23-bit mantissa of IEEE single-precision number.
-	 * 3. Add 0x70 to the exponent (starting at bit 23) to compensate the different in exponent bias
-	 *    (0x7F for single-precision number less 0xF for half-precision number).
-	 * 4. Subtract renorm_shift from the exponent (starting at bit 23) to account for renormalization. As renorm_shift
-	 *    is less than 0x70, this can be combined with step 3.
-	 * 5. Binary OR with inf_nan_mask to turn the exponent into 0xFF if the input was NaN or infinity.
-	 * 6. Binary ANDNOT with zero_mask to turn the mantissa and exponent into zero if the input was zero. 
-	 * 7. Combine with the sign of the input number.
-	 */
-	return sign | ((((nonsign << renorm_shift >> 3) + ((0x70 - renorm_shift) << 23)) | inf_nan_mask) & ~zero_mask);
+  renorm_shift = renorm_shift > 5 ? renorm_shift - 5 : 0;
+  /*
+   * Iff half-precision number has exponent of 15, the addition overflows it
+   * into bit 31, and the subsequent shift turns the high 9 bits into 1. Thus
+   *   inf_nan_mask ==
+   *                   0x7F800000 if the half-precision number had exponent of
+   * 15 (i.e. was NaN or infinity) 0x00000000 otherwise
+   */
+  const int32_t inf_nan_mask =
+      ((int32_t)(nonsign + 0x04000000) >> 8) & INT32_C(0x7F800000);
+  /*
+   * Iff nonsign is 0, it overflows into 0xFFFFFFFF, turning bit 31 into 1.
+   * Otherwise, bit 31 remains 0. The signed shift right by 31 broadcasts bit 31
+   * into all bits of the zero_mask. Thus zero_mask == 0xFFFFFFFF if the
+   * half-precision number was zero (+0.0h or -0.0h) 0x00000000 otherwise
+   */
+  const int32_t zero_mask = (int32_t)(nonsign - 1) >> 31;
+  /*
+   * 1. Shift nonsign left by renorm_shift to normalize it (if the input was
+   * denormal)
+   * 2. Shift nonsign right by 3 so the exponent (5 bits originally) becomes an
+   * 8-bit field and 10-bit mantissa shifts into the 10 high bits of the 23-bit
+   * mantissa of IEEE single-precision number.
+   * 3. Add 0x70 to the exponent (starting at bit 23) to compensate the
+   * different in exponent bias (0x7F for single-precision number less 0xF for
+   * half-precision number).
+   * 4. Subtract renorm_shift from the exponent (starting at bit 23) to account
+   * for renormalization. As renorm_shift is less than 0x70, this can be
+   * combined with step 3.
+   * 5. Binary OR with inf_nan_mask to turn the exponent into 0xFF if the input
+   * was NaN or infinity.
+   * 6. Binary ANDNOT with zero_mask to turn the mantissa and exponent into zero
+   * if the input was zero.
+   * 7. Combine with the sign of the input number.
+   */
+  return sign |
+         ((((nonsign << renorm_shift >> 3) + ((0x70 - renorm_shift) << 23)) |
+           inf_nan_mask) &
+          ~zero_mask);
 }
 
-
-void dump_fp16_tensor(bm_handle_t bm_handle, bm_tensor_t &tensor, int offset) {
-  auto shape = tensor.shape;
-  int size = 1;
-  for (int i = 0; i < shape.num_dims; ++i){
-    size *= shape.dims[i];
-  }
+void dump_fp16_tensor(bm_handle_t bm_handle, bm_device_mem_t &mem, int offset) {
+  int size = 20;
   std::vector<uint16_t> data(size);
-  bm_memcpy_d2s(bm_handle, data.data(), tensor.device_mem);
-  std::cout<<"-------------------------------------"<<std::endl;
+  bm_memcpy_d2s_partial_offset(bm_handle, data.data(), mem, size, offset);
+  std::cout << "-------------------------------------" << std::endl;
   fp32 t;
-  t.bits = fp16_ieee_to_fp32_bits(data[data.size()-1]);
-  std::cout<< t.fval << std::endl;
-  for(int i=0;i<10;i++){
+  t.bits = fp16_ieee_to_fp32_bits(data[data.size() - 1]);
+  std::cout << t.fval << std::endl;
+  for (int i = 0; i < 10; i++) {
     fp32 t;
     t.bits = fp16_ieee_to_fp32_bits(data[i]);
-    std::cout<< t.fval << std::endl;
+    std::cout << t.fval << std::endl;
   }
-  std::cout<<"-------------------------------------"<<std::endl;
+  std::cout << "-------------------------------------" << std::endl;
   // uint32_t t = fp16_ieee_to_fp32_bits(data[0]);
   // std::cout << (float)t << std::endl;
   auto ptr = data.data();
   ptr[0] = ptr[0];
 }
 
+
+
 class Qwen {
 public:
   void init(const std::vector<int> &devid, int eos_token_id, std::string model_path);
   void deinit();
+  int forward_first(std::vector<int> &tokens, std::string mode = "sample");
+  int forward_next(int cur_token, std::string mode = "sample");
   std::vector<int> answer(std::vector<int> history_tokens);
 
 private:
-  int forward_first(std::vector<int> &tokens);
-  int forward_next(int cur_token);
+  int sample(const std::vector<float>& probs, const std::vector<int>& tokens);
 
 private:
   std::vector<bm_handle_t> handles;
@@ -151,9 +165,11 @@ private:
   std::vector<const bm_net_info_t *> net_blocks;
   std::vector<const bm_net_info_t *> net_blocks_cache;
   std::vector<bm_tensor_t> inputs_embed_512, outputs_embed_512;
-  std::vector<bm_tensor_t> inputs_pid, next_pid, inputs_attention, next_attention;
+  std::vector<bm_tensor_t> inputs_pid, inputs_attention;
+  std::vector<bm_tensor_t> next_inputid, next_pid, next_attention;
   std::vector<std::vector<bm_tensor_t>> past_key, past_value;
-  std::vector<bm_tensor_t> inputs_lm, outputs_lm;
+  std::vector<bm_tensor_t> inputs_lm;
+  std::vector<bm_tensor_t> outputs_logit_lm, outputs_token_lm;
   std::string name_embed;
   std::string name_embed_cache;
   std::string name_lm;
@@ -252,6 +268,15 @@ void Qwen::init(const std::vector<int> &devices, int eos_token_id, std::string m
     assert(true == ret);
   }
 
+  next_inputid.resize(device_num);  
+  for (int i = 0; i < device_num; ++i) {
+    ret = bmrt_tensor_ex(&next_inputid[i], p_bmrt,
+                        net_embed_cache->input_loc_devices[i],
+                        net_embed_cache->input_dtypes[i],
+                        net_embed_cache->stages[0].input_shapes[i]);
+    assert(true == ret);
+  }
+
   inputs_pid.resize(device_num);
   inputs_attention.resize(device_num);
   int in_num = net_blocks[0]->input_num / device_num;
@@ -268,7 +293,6 @@ void Qwen::init(const std::vector<int> &devices, int eos_token_id, std::string m
                         net_blocks[0]->stages[0].input_shapes[2 + i * in_num]);
     assert(true == ret);
   }
-
 
   next_pid.resize(device_num);
   next_attention.resize(device_num);
@@ -306,13 +330,17 @@ void Qwen::init(const std::vector<int> &devices, int eos_token_id, std::string m
   }
 
   inputs_lm.resize(device_num);
-  outputs_lm.resize(device_num);
+  outputs_logit_lm.resize(device_num);
+  outputs_token_lm.resize(device_num);
   for (int i = 0; i < device_num; ++i) {
     ret = bmrt_tensor_ex(&inputs_lm[i], p_bmrt, i, net_lm->input_dtypes[0],
                         net_lm->stages[0].input_shapes[0]);
     assert(true == ret);
-    ret = bmrt_tensor_ex(&outputs_lm[i], p_bmrt, i, net_lm->output_dtypes[0],
+    ret = bmrt_tensor_ex(&outputs_logit_lm[i], p_bmrt, i, net_lm->output_dtypes[0],
                         net_lm->stages[0].output_shapes[0]);
+    assert(true == ret);    
+    ret = bmrt_tensor_ex(&outputs_token_lm[i], p_bmrt, i, net_lm->output_dtypes[1],
+                        net_lm->stages[0].output_shapes[1]);
     assert(true == ret);
   }
 }
@@ -322,11 +350,13 @@ void Qwen::deinit() {
     bm_free_device(handles[i], inputs_embed_512[i].device_mem);
     bm_free_device(handles[i], outputs_embed_512[i].device_mem);
     bm_free_device(handles[i], inputs_pid[i].device_mem);
-    bm_free_device(handles[i], next_pid[i].device_mem);
     bm_free_device(handles[i], inputs_attention[i].device_mem);
+    bm_free_device(handles[i], next_inputid[i].device_mem);
+    bm_free_device(handles[i], next_pid[i].device_mem);
     bm_free_device(handles[i], next_attention[i].device_mem);
     bm_free_device(handles[i], inputs_lm[i].device_mem);
-    bm_free_device(handles[i], outputs_lm[i].device_mem);
+    bm_free_device(handles[i], outputs_logit_lm[i].device_mem);
+    bm_free_device(handles[i], outputs_token_lm[i].device_mem);
   }
   for (int i = 0; i < NUM_LAYERS; i++) {
     for (int j = 0; j < device_num; j++) {
@@ -340,11 +370,38 @@ void Qwen::deinit() {
   }
 }
 
-int Qwen::forward_first(std::vector<int> &tokens) {
+std::vector<float> softmax(const std::vector<float>& logits) {
+  std::vector<float> exp_values;
+  exp_values.reserve(logits.size());
+  float max_logit = *std::max_element(logits.begin(), logits.end());
+  for (float logit : logits) {
+    exp_values.push_back(std::exp(logit - max_logit));
+  }
+  float sum_of_exp = std::accumulate(exp_values.begin(), exp_values.end(), 0.0);
+  for (float& value : exp_values) {
+    value /= sum_of_exp;
+  }
+  return exp_values;
+}
+
+int Qwen::sample(const std::vector<float>& probs, const std::vector<int>& tokens) {
+  auto softmax_probs = softmax(probs);
+
+  // create random generator
+  std::random_device rd;
+  std::mt19937 gen(rd());
+
+  std::discrete_distribution<> dist(softmax_probs.begin(), softmax_probs.end());
+  return tokens[dist(gen)];
+}
+
+int Qwen::forward_first(std::vector<int> &tokens, std::string mode) {
   std::vector<int> input_ids(SEQLEN, 0);
   std::vector<int> position_id(SEQLEN, 0);
   std::vector<uint16_t> attention_mask(SEQLEN * SEQLEN, ATTENTION_MASK);
   std::copy(tokens.begin(), tokens.end(), input_ids.data());
+  
+  token_length = tokens.size();
 
   for (int i = 0; i < token_length; i++) {
     position_id[i] = i;
@@ -405,19 +462,36 @@ int Qwen::forward_first(std::vector<int> &tokens) {
 
   // forward lmhead
   int bytes = embed_512[0].device_mem.size / SEQLEN;
+  std::vector<bm_tensor_t> outputs_lm{outputs_logit_lm[0], outputs_token_lm[0]};
   bm_memcpy_d2d_byte(bm_handle, inputs_lm[0].device_mem, 0,
                      embed_512[0].device_mem, (token_length - 1) * bytes,
                      bytes);
   ret = bmrt_launch_tensor_ex(p_bmrt, name_lm.c_str(), &inputs_lm[0], 1,
-                              &outputs_lm[0], 1, true, false);
+                              outputs_lm.data(), outputs_lm.size(), true, false);
   bm_thread_sync(bm_handle);
 
+
+  // get logit & token
   int token = 0;
-  bm_memcpy_d2s(bm_handle, (void *)&token, outputs_lm[0].device_mem);
+  int candidate_num = net_lm->stages[0].output_shapes[0].dims[1];
+  std::vector<float> logits(candidate_num);
+  bm_memcpy_d2s(bm_handle, logits.data(), outputs_lm[0].device_mem);
+  std::vector<int> candidate_tokens(candidate_num);
+  bm_memcpy_d2s(bm_handle, candidate_tokens.data(), outputs_lm[1].device_mem);
+
+  // select final token from candidate tokens
+  if (mode == "greedy") {
+    token = candidate_tokens[0];
+  } else if (mode == "sample") {
+    token = sample(logits, candidate_tokens);
+  }
+  
   return token;
 }
 
-int Qwen::forward_next(int cur_token) {
+int Qwen::forward_next(int cur_token, std::string mode) {
+  token_length += 1;
+
   std::vector<uint16_t> attention_mask(SEQLEN + 1, 0);
   for (int i = token_length - 1; i < SEQLEN; i++) {
     attention_mask[i] = ATTENTION_MASK;
@@ -428,8 +502,12 @@ int Qwen::forward_next(int cur_token) {
   std::vector<bm_tensor_t> inputs_embed;
   std::vector<void*> input_datas;
   std::vector<int> input_nums(device_num, 1);
+
+  std::vector<void*> inputid_datas(device_num, &cur_token);
+  bmrt_memcpy_s2d_parallel(p_bmrt, next_inputid.data(), inputid_datas.data(),
+                          input_nums.data(), device_num);
   for (int i = 0; i < device_num; ++i) {
-    inputs_embed.push_back(outputs_lm[i]); // token_id
+    inputs_embed.push_back(next_inputid[i]); // token_id
     inputs_embed[i].shape = net_embed_cache->stages[0].input_shapes[0];
     input_datas.push_back((void*)(&cur_token));
   }
@@ -440,7 +518,6 @@ int Qwen::forward_next(int cur_token) {
                                   inputs_lm.data(), inputs_lm.size(), true, false);
   assert(ret);
   bm_thread_sync(bm_handle);
-  dump_fp16_tensor(bm_handle, inputs_lm[0], 0);
 
   // forward blocks
   std::vector<void*> attn_datas(device_num, attention_mask.data());
@@ -488,21 +565,31 @@ int Qwen::forward_next(int cur_token) {
   }
 
   // forward lmhead
-  dump_fp16_tensor(bm_handle, inputs_lm[0], 0);
+  std::vector<bm_tensor_t> outputs_lm{outputs_logit_lm[0], outputs_token_lm[0]};
   ret = bmrt_launch_tensor_ex(p_bmrt, name_lm.c_str(), &inputs_lm[0], 1,
-                              &outputs_lm[0], 1, true, false);
-  assert(ret);
+                              outputs_lm.data(), outputs_lm.size(), true, false);
   bm_thread_sync(bm_handle);
 
+  // get logit & token
   int token = 0;
-  bm_memcpy_d2s(bm_handle, (void *)&token, outputs_lm[0].device_mem);
+  int candidate_num = net_lm->stages[0].output_shapes[0].dims[1];
+  std::vector<float> logits(candidate_num);
+  bm_memcpy_d2s(bm_handle, logits.data(), outputs_lm[0].device_mem);
+  std::vector<int> candidate_tokens(candidate_num);
+  bm_memcpy_d2s(bm_handle, candidate_tokens.data(), outputs_lm[1].device_mem);
+
+  // select final token from candidate tokens
+  if (mode == "greedy") {
+    token = candidate_tokens[0];
+  } else if (mode == "sample") {
+    token = sample(logits, candidate_tokens);
+  }
+
   return token;
 }
 
 std::vector<int> Qwen::answer(std::vector<int> history_tokens) {
-  // auto time_0 = std::chrono::system_clock::now();
   int tok_num = 0;
-  
   if (history_tokens.empty()) {
     printf("Sorry: your question is too wierd!!\n");
     history_tokens.clear();
@@ -516,34 +603,22 @@ std::vector<int> Qwen::answer(std::vector<int> history_tokens) {
     return {};
   }
 
-  auto t0 = std::chrono::system_clock::now();
+  std::vector<int> result_tokens;
   int token = forward_first(history_tokens);
-  auto t1 = std::chrono::system_clock::now();
   while (token != EOS && token_length < SEQLEN) {
-    history_tokens.emplace_back(token);
-    
-    if (token_length < SEQLEN) {
-      token_length++;
-    }
+    result_tokens.emplace_back(token);
     tok_num++;
     token = forward_next(token);
   }
-  auto t2 = std::chrono::system_clock::now();
-  auto use0 = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-  auto use1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-  printf("\n\nfirst token latency: %f s", (use0.count() * 1e-6));
-  printf("\nspeed: %f token/s\n", tok_num / (use1.count() * 1e-6));
-  // if (token_length >= SEQLEN) {
-  //   history_tokens.clear();
-  // }
-  return history_tokens;
+
+  return result_tokens;
 }
 
 int main(int argc, char **argv) {
   // set your bmodel path here
   printf("Demo for Qwen in BM1684X\n");
   std::vector<int> devices{0};
-  std::string model_path = "qwen1.5-1.8b_int4_1dev.bmodel";
+  std::string model_path = "qwen1.5-1.8b_int4_1dev_topk.bmodel";
   int eos = 151645;
   std::vector<int> model_inputs = {151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 14990, 151645, 198, 151644, 77091, 198};
 
@@ -551,7 +626,7 @@ int main(int argc, char **argv) {
   printf("Init Environment ...\n");
   qwen.init(devices, eos, model_path);
   printf("==========================\n");
-  qwen.answer(model_inputs);
+  auto result = qwen.answer(model_inputs);
   qwen.deinit();
   return 0;
 }
