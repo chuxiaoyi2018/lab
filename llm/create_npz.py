@@ -4,10 +4,10 @@ import torch
 np.random.seed(42)
 torch.manual_seed(0)
 
-HIDDEN_SIZE = 1024
-SEQ_LENGTH = 32
-HEAD_DIM = 64
-HEAD_NUM = 16
+HIDDEN_SIZE = 4096
+SEQ_LENGTH = 8192
+HEAD_DIM = 128
+HEAD_NUM = 32
 coeff = 1.0
 
 
